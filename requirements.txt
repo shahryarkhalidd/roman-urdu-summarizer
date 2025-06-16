@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-onnxruntime
-transformers
-huggingface_hub
-scipy
-numpy
