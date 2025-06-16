@@ -53,3 +53,8 @@ async def summarize(input: InputText):
 
     summary = tokenizer.decode(decoder_input_ids[0], skip_special_tokens=True)
     return {"summary": summary}
+
+@app.get("/")
+def root():
+    return {"message": "Roman Urdu Summarizer API is running"}
+
