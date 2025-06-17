@@ -29,7 +29,7 @@ async def summarize(input: InputText):
     decoder_input_ids = np.array([[tokenizer.pad_token_id]])
     decoder_attention_mask = np.array([[1]])
 
-    max_length = 50
+    max_length = 70
     for _ in range(max_length):
         outputs = session.run(
             None,
