@@ -8,19 +8,32 @@ from huggingface_hub import hf_hub_download
 
 app = FastAPI()
 
-# Download model + tokenizer from Hugging Face
-model_path = hf_hub_download("radientsoul88/roman-urdu-summarizer", "t5_urdu_quant.onnx")
-tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
+# Global cache variables
+session = None
+tokenizer = None
 
-# Load ONNX session
-session = ort.InferenceSession(model_path)
-
-# Input format
 class InputText(BaseModel):
     text: str
 
+@app.on_event("startup")
+def load_model_and_tokenizer():
+    global session, tokenizer
+    print("🔄 Loading model and tokenizer...")
+
+    # Download model
+    model_path = hf_hub_download("radientsoul88/roman-urdu-summarizer", "t5_urdu_quant.onnx")
+    
+    # Load tokenizer
+    tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
+
+    # Load ONNX session
+    session = ort.InferenceSession(model_path)
+    print("✅ Model and tokenizer loaded.")
+
 @app.post("/summarize")
 async def summarize(input: InputText):
+    global session, tokenizer
+
     input_text = input.text
     inputs = tokenizer("summarize: " + input_text, return_tensors="np")
     input_ids = inputs["input_ids"]
@@ -57,4 +70,3 @@ async def summarize(input: InputText):
 @app.get("/")
 def root():
     return {"message": "Roman Urdu Summarizer API is running"}
-
