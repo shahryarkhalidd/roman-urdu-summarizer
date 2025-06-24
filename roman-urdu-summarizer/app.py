@@ -1,169 +1,152 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import onnxruntime as ort
-import numpy as np
-from transformers import T5Tokenizer, T5ForConditionalGeneration
-from huggingface_hub import hf_hub_download
-import torch
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
-model = None
-tokenizer = None
+
+# Global variables for models
+model_engine = None
+executor = ThreadPoolExecutor(max_workers=1)
 
 class InputText(BaseModel):
     text: str
 
 @app.on_event("startup")
-def load_model_and_tokenizer():
-    global model, tokenizer
-    print("🔄 Loading model and tokenizer...")
+async def load_model():
+    global model_engine
+    print("🔄 Installing and loading optimized T5 model...")
     
-    # Load tokenizer
-    tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
-    
-    # Try to load PyTorch model first (much faster for generation)
     try:
-        print("🔄 Attempting to load PyTorch model...")
-        model = T5ForConditionalGeneration.from_pretrained("radientsoul88/roman-urdu-summarizer")
+        # Import fastT5 - this handles the ONNX optimization properly
+        from fastt5 import OnnxT5
         
-        # Set to evaluation mode
-        model.eval()
+        print("🔄 Loading model with fastT5 (optimized ONNX with KV-cache)...")
         
-        # Move to CPU (or GPU if available)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(device)
-        print(f"✅ PyTorch model loaded on {device}")
+        # Load the model with proper ONNX optimization
+        model_engine = OnnxT5.from_pretrained("radientsoul88/roman-urdu-summarizer")
+        
+        print("✅ Model loaded successfully with fastT5 optimization")
         
         # Warm-up
         print("🔥 Running warm-up...")
-        dummy_input = "summarize: test message"
-        inputs = tokenizer(dummy_input, return_tensors="pt", max_length=64, truncation=True, padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        test_summary = model_engine("summarize: this is a test message", max_length=20)
+        print(f"🚀 Warm-up completed. Test output: {test_summary}")
         
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_length=20,
-                num_beams=2,
-                early_stopping=True,
-                do_sample=False
-            )
-        print("🚀 Warm-up completed successfully.")
+    except ImportError:
+        print("❌ fastT5 not installed. Installing now...")
+        import subprocess
+        import sys
+        
+        # Install fastT5
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "fastt5"])
+        
+        # Try again
+        from fastt5 import OnnxT5
+        model_engine = OnnxT5.from_pretrained("radientsoul88/roman-urdu-summarizer")
+        print("✅ fastT5 installed and model loaded")
         
     except Exception as e:
-        print(f"⚠️ Failed to load PyTorch model: {e}")
-        print("🔄 Falling back to ONNX with optimized generation...")
+        print(f"⚠️ fastT5 failed, trying alternative approach: {e}")
         
-        # Fallback to optimized ONNX approach
-        model_path = hf_hub_download("radientsoul88/roman-urdu-summarizer", "t5_urdu_quant.onnx")
-        
-        session_options = ort.SessionOptions()
-        session_options.inter_op_num_threads = 1  # Single thread often faster for small models
-        session_options.intra_op_num_threads = 1
-        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        model = ort.InferenceSession(
-            model_path, 
-            sess_options=session_options,
-            providers=["CPUExecutionProvider"]
-        )
-        print("✅ ONNX model loaded with optimizations")
+        # Fallback to onnxt5 library
+        try:
+            import subprocess
+            import sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxt5"])
+            
+            from onnxt5 import GenerativeT5
+            from onnxt5.api import get_encoder_decoder_tokenizer
+            
+            # Load with onnxt5 (alternative optimized library)
+            model_path = "radientsoul88/roman-urdu-summarizer"
+            encoder, decoder, tokenizer = get_encoder_decoder_tokenizer(model_path)
+            model_engine = GenerativeT5(encoder, decoder, tokenizer)
+            print("✅ Model loaded with onnxt5 optimization")
+            
+        except Exception as e2:
+            print(f"❌ All optimized approaches failed: {e2}")
+            print("🔄 Loading PyTorch model as final fallback...")
+            
+            # Final fallback to PyTorch
+            from transformers import T5ForConditionalGeneration, T5Tokenizer
+            import torch
+            
+            global tokenizer
+            tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
+            model_engine = T5ForConditionalGeneration.from_pretrained("radientsoul88/roman-urdu-summarizer")
+            model_engine.eval()
+            
+            # Enable optimizations
+            if torch.cuda.is_available():
+                model_engine = model_engine.to("cuda")
+                print("✅ PyTorch model loaded on GPU")
+            else:
+                model_engine = model_engine.to("cpu")
+                print("✅ PyTorch model loaded on CPU")
 
-def generate_with_pytorch(input_text: str):
-    """Fast generation using PyTorch model"""
-    device = next(model.parameters()).device
-    
-    inputs = tokenizer(
-        input_text, 
-        return_tensors="pt", 
-        max_length=128, 
-        truncation=True, 
-        padding=True
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_length=30,  # Adjust based on your needs
-            min_length=5,
-            num_beams=2,    # Beam search for better quality
-            early_stopping=True,
-            do_sample=False,  # Deterministic generation
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            length_penalty=1.0
-        )
-    
-    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return summary.strip()
-
-def generate_with_onnx_optimized(input_text: str):
-    """Optimized ONNX generation - use all outputs at once"""
-    inputs = tokenizer(
-        input_text, 
-        return_tensors="np", 
-        max_length=128, 
-        truncation=True, 
-        padding=True
-    )
-    
-    input_ids = inputs["input_ids"].astype(np.int64)
-    attention_mask = inputs["attention_mask"].astype(np.int64)
-    
-    # Generate longer sequence at once instead of token by token
-    decoder_input_ids = np.array([[tokenizer.pad_token_id] * 20], dtype=np.int64)  # Pre-allocate
-    
+def generate_summary_sync(input_text: str) -> str:
+    """Synchronous function to run in thread pool"""
     try:
-        # Single inference call with longer decoder sequence
-        outputs = model.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "decoder_input_ids": decoder_input_ids,
-            }
-        )
-        
-        logits = outputs[0]
-        # Take the most likely tokens across the sequence
-        predicted_ids = np.argmax(logits, axis=-1)
-        
-        # Find EOS token position
-        eos_positions = np.where(predicted_ids[0] == tokenizer.eos_token_id)[0]
-        if len(eos_positions) > 0:
-            predicted_ids = predicted_ids[0][:eos_positions[0]]
+        # Check which model type we're using
+        if hasattr(model_engine, '__call__') and not hasattr(model_engine, 'generate'):
+            # fastT5 or onnxt5
+            summary = model_engine(f"summarize: {input_text}", max_length=30, min_length=5)
+            return summary if isinstance(summary, str) else summary[0]
+            
         else:
-            predicted_ids = predicted_ids[0][:10]  # Take first 10 tokens
-        
-        summary = tokenizer.decode(predicted_ids, skip_special_tokens=True)
-        return summary.strip()
-        
+            # PyTorch model
+            from transformers import T5Tokenizer
+            tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
+            
+            inputs = tokenizer(
+                f"summarize: {input_text}",
+                return_tensors="pt",
+                max_length=128,
+                truncation=True,
+                padding=True
+            )
+            
+            # Move to same device as model
+            device = next(model_engine.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = model_engine.generate(
+                    **inputs,
+                    max_length=30,
+                    min_length=5,
+                    num_beams=2,
+                    early_stopping=True,
+                    do_sample=False,
+                    length_penalty=1.0
+                )
+            
+            summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return summary.strip()
+            
     except Exception as e:
-        print(f"ONNX generation failed: {e}")
-        return "Error in generation"
+        return f"Generation failed: {str(e)}"
 
 @app.post("/summarize")
 async def summarize(input: InputText):
+    if model_engine is None:
+        return {"error": "Model not loaded"}
+    
     start_time = time.time()
     
-    input_text = f"summarize: {input.text}"
-    
     try:
-        if isinstance(model, T5ForConditionalGeneration):
-            # Use PyTorch model (much faster)
-            summary = generate_with_pytorch(input_text)
-        else:
-            # Use optimized ONNX approach
-            summary = generate_with_onnx_optimized(input_text)
+        # Run the generation in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        summary = await loop.run_in_executor(executor, generate_summary_sync, input.text)
         
         generation_time = time.time() - start_time
         
         return {
             "summary": summary,
-            "generation_time_seconds": round(generation_time, 2)
+            "generation_time_seconds": round(generation_time, 2),
+            "model_type": type(model_engine).__name__
         }
         
     except Exception as e:
@@ -174,14 +157,37 @@ async def summarize(input: InputText):
 
 @app.get("/")
 def root():
-    return {"message": "Roman Urdu Summarizer API is running"}
+    return {"message": "Optimized Roman Urdu Summarizer API is running"}
 
 @app.get("/health")
 def health_check():
-    model_type = "PyTorch" if isinstance(model, T5ForConditionalGeneration) else "ONNX"
     return {
         "status": "healthy",
-        "model_type": model_type,
-        "model_loaded": model is not None,
-        "tokenizer_loaded": tokenizer is not None
+        "model_loaded": model_engine is not None,
+        "model_type": type(model_engine).__name__ if model_engine else None
+    }
+
+# Alternative endpoint for batch processing
+@app.post("/batch_summarize")
+async def batch_summarize(inputs: list[InputText]):
+    if model_engine is None:
+        return {"error": "Model not loaded"}
+    
+    start_time = time.time()
+    results = []
+    
+    for item in inputs:
+        try:
+            loop = asyncio.get_event_loop()
+            summary = await loop.run_in_executor(executor, generate_summary_sync, item.text)
+            results.append({"text": item.text, "summary": summary, "success": True})
+        except Exception as e:
+            results.append({"text": item.text, "error": str(e), "success": False})
+    
+    total_time = time.time() - start_time
+    
+    return {
+        "results": results,
+        "total_time_seconds": round(total_time, 2),
+        "average_time_per_item": round(total_time / len(inputs), 2)
     }
