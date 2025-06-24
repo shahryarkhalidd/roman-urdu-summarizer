@@ -7,7 +7,6 @@ from huggingface_hub import hf_hub_download
 
 app = FastAPI()
 
-# Global cache variables
 session = None
 tokenizer = None
 
@@ -23,22 +22,35 @@ def load_model_and_tokenizer():
     tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
     session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
 
-    print("✅ Model and tokenizer loaded.")
+    print("✅ Model and tokenizer loaded. Running warm-up...")
+
+    # 🔥 WARM-UP (1 dummy inference to compile graph)
+    dummy_input = "summarize: yeh aik test message hai"
+    inputs = tokenizer(dummy_input, return_tensors="np", padding="max_length", max_length=64, truncation=True)
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    decoder_input_ids = np.array([[tokenizer.pad_token_id]])
+
+    session.run(None, {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "decoder_input_ids": decoder_input_ids,
+    })
+    print("🚀 Warm-up done.")
 
 @app.post("/summarize")
 async def summarize(input: InputText):
     global session, tokenizer
 
-    # Prepare input
     input_text = "summarize: " + input.text
-    inputs = tokenizer(input_text, return_tensors="np", padding="max_length", max_length=512, truncation=True)
+    inputs = tokenizer(input_text, return_tensors="np", padding="max_length", max_length=128, truncation=True)
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
 
     decoder_input_ids = np.array([[tokenizer.pad_token_id]])
-    max_length = 30
+    max_tokens = 15  # Shorten max length for faster generation
 
-    for _ in range(max_length):
+    for _ in range(max_tokens):
         outputs = session.run(
             None,
             {
