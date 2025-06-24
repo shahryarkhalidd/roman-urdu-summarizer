@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import os
 
 app = FastAPI()
 
@@ -17,128 +18,173 @@ class InputText(BaseModel):
 @app.on_event("startup")
 async def load_model():
     global model_engine, tokenizer
-    print("🔄 Installing and loading optimized T5 model...")
+    print("🔄 Loading lightweight model for fast deployment...")
     
     try:
-        # Import fastT5 - this handles the ONNX optimization properly
-        from fastt5 import OnnxT5
+        # First try the lightweight transformers approach (CPU-only)
+        print("🔄 Loading PyTorch model (CPU-only)...")
         
-        print("🔄 Loading model with fastT5 (optimized ONNX with KV-cache)...")
+        # Set environment variables to force CPU and avoid CUDA
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
         
-        # Load the model with proper ONNX optimization
-        model_engine = OnnxT5.from_pretrained("radientsoul88/roman-urdu-summarizer")
+        from transformers import T5ForConditionalGeneration, T5Tokenizer
+        import torch
         
-        print("✅ Model loaded successfully with fastT5 optimization")
+        # Force CPU usage
+        torch.set_num_threads(2)  # Limit threads for faster startup
         
-        # Warm-up
-        print("🔥 Running warm-up...")
-        test_summary = model_engine("summarize: this is a test message", max_length=20)
-        print(f"🚀 Warm-up completed. Test output: {test_summary}")
+        print("📥 Downloading tokenizer...")
+        tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
         
-    except ImportError:
-        print("❌ fastT5 not installed. Installing now...")
-        import subprocess
-        import sys
+        print("📥 Downloading model...")
+        model_engine = T5ForConditionalGeneration.from_pretrained(
+            "radientsoul88/roman-urdu-summarizer",
+            torch_dtype=torch.float32,  # Use float32 for CPU
+            device_map="cpu",
+            low_cpu_mem_usage=True
+        )
+        model_engine.eval()
         
-        # Install fastT5
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "fastt5"])
+        print("✅ PyTorch model loaded successfully on CPU")
         
-        # Try again
-        from fastt5 import OnnxT5
-        model_engine = OnnxT5.from_pretrained("radientsoul88/roman-urdu-summarizer")
-        print("✅ fastT5 installed and model loaded")
+        # Quick warm-up
+        print("🔥 Running quick warm-up...")
+        test_input = tokenizer("summarize: test", return_tensors="pt", max_length=32, truncation=True)
+        
+        with torch.no_grad():
+            outputs = model_engine.generate(
+                **test_input,
+                max_length=20,
+                num_beams=1,  # Faster generation
+                do_sample=False,
+                early_stopping=True
+            )
+        
+        test_summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(f"🚀 Warm-up completed. Test: {test_summary}")
         
     except Exception as e:
-        print(f"⚠️ fastT5 failed, trying alternative approach: {e}")
+        print(f"⚠️ PyTorch loading failed: {e}")
+        print("🔄 Trying lightweight ONNX approach...")
         
-        # Fallback to onnxt5 library
         try:
-            import subprocess
-            import sys
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxt5"])
+            # Fallback to basic ONNX with optimizations
+            import onnxruntime as ort
+            import numpy as np
+            from transformers import T5Tokenizer
+            from huggingface_hub import hf_hub_download
             
-            from onnxt5 import GenerativeT5
-            from onnxt5.api import get_encoder_decoder_tokenizer
-            
-            # Load with onnxt5 (alternative optimized library)
-            model_path = "radientsoul88/roman-urdu-summarizer"
-            encoder, decoder, tokenizer = get_encoder_decoder_tokenizer(model_path)
-            model_engine = GenerativeT5(encoder, decoder, tokenizer)
-            print("✅ Model loaded with onnxt5 optimization")
-            
-        except Exception as e2:
-            print(f"❌ All optimized approaches failed: {e2}")
-            print("🔄 Loading PyTorch model as final fallback...")
-            
-            # Final fallback to PyTorch
-            from transformers import T5ForConditionalGeneration, T5Tokenizer
-            import torch
-            
+            print("📥 Loading ONNX model...")
+            model_path = hf_hub_download("radientsoul88/roman-urdu-summarizer", "t5_urdu_quant.onnx")
             tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
-            model_engine = T5ForConditionalGeneration.from_pretrained("radientsoul88/roman-urdu-summarizer")
-            model_engine.eval()
             
-            # Enable optimizations
-            if torch.cuda.is_available():
-                model_engine = model_engine.to("cuda")
-                print("✅ PyTorch model loaded on GPU")
-            else:
-                model_engine = model_engine.to("cpu")
-                print("✅ PyTorch model loaded on CPU")
-
-def generate_summary_sync(input_text: str) -> str:
-    """Synchronous function to run in thread pool"""
-    try:
-        # Check which model type we're using
-        if hasattr(model_engine, '__call__') and not hasattr(model_engine, 'generate'):
-            # fastT5 or onnxt5
-            summary = model_engine(f"summarize: {input_text}", max_length=30, min_length=5)
-            return summary if isinstance(summary, str) else summary[0]
+            # Optimized ONNX session for CPU
+            session_options = ort.SessionOptions()
+            session_options.inter_op_num_threads = 1
+            session_options.intra_op_num_threads = 1
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             
-        else:
-            # PyTorch model
-            if tokenizer is None:
-                from transformers import T5Tokenizer
-                tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
-            
-            inputs = tokenizer(
-                f"summarize: {input_text}",
-                return_tensors="pt",
-                max_length=128,
-                truncation=True,
-                padding=True
+            model_engine = ort.InferenceSession(
+                model_path,
+                sess_options=session_options,
+                providers=["CPUExecutionProvider"]
             )
             
-            # Move to same device as model
-            device = next(model_engine.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            print("✅ ONNX model loaded successfully")
             
-            with torch.no_grad():
-                outputs = model_engine.generate(
-                    **inputs,
-                    max_length=30,
-                    min_length=5,
-                    num_beams=2,
-                    early_stopping=True,
-                    do_sample=False,
-                    length_penalty=1.0
-                )
-            
-            summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return summary.strip()
-            
+        except Exception as e2:
+            print(f"❌ All model loading failed: {e2}")
+            # Set a flag to indicate model loading failed
+            model_engine = "failed"
+
+def generate_summary_pytorch(input_text: str) -> str:
+    """Fast PyTorch generation"""
+    try:
+        inputs = tokenizer(
+            f"summarize: {input_text}",
+            return_tensors="pt",
+            max_length=96,  # Reduced for speed
+            truncation=True,
+            padding=True
+        )
+        
+        with torch.no_grad():
+            outputs = model_engine.generate(
+                **inputs,
+                max_length=25,  # Short summaries
+                min_length=3,
+                num_beams=1,    # Faster than beam search
+                do_sample=False,
+                early_stopping=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return summary.strip()
+        
     except Exception as e:
         return f"Generation failed: {str(e)}"
 
+def generate_summary_onnx(input_text: str) -> str:
+    """Optimized ONNX generation"""
+    try:
+        inputs = tokenizer(
+            f"summarize: {input_text}",
+            return_tensors="np",
+            max_length=96,
+            truncation=True,
+            padding=True
+        )
+        
+        input_ids = inputs["input_ids"].astype(np.int64)
+        attention_mask = inputs["attention_mask"].astype(np.int64)
+        decoder_input_ids = np.array([[tokenizer.pad_token_id]], dtype=np.int64)
+        
+        # Generate up to 8 tokens (for speed)
+        for _ in range(8):
+            outputs = model_engine.run(
+                None,
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "decoder_input_ids": decoder_input_ids,
+                }
+            )
+            
+            logits = outputs[0]
+            next_token_logits = logits[:, -1, :]
+            next_token_id = np.argmax(next_token_logits, axis=-1, keepdims=True)
+            
+            if next_token_id[0, 0] == tokenizer.eos_token_id:
+                break
+                
+            decoder_input_ids = np.hstack([decoder_input_ids, next_token_id])
+        
+        summary = tokenizer.decode(decoder_input_ids[0], skip_special_tokens=True)
+        return summary.strip()
+        
+    except Exception as e:
+        return f"ONNX generation failed: {str(e)}"
+
+def generate_summary_sync(input_text: str) -> str:
+    """Synchronous generation function"""
+    if model_engine == "failed":
+        return "Model failed to load"
+    
+    # Check model type and use appropriate generation
+    if hasattr(model_engine, 'generate'):
+        return generate_summary_pytorch(input_text)
+    else:
+        return generate_summary_onnx(input_text)
+
 @app.post("/summarize")
 async def summarize(input: InputText):
-    if model_engine is None:
-        return {"error": "Model not loaded"}
-    
     start_time = time.time()
     
     try:
-        # Run the generation in a thread pool to avoid blocking
+        # Run generation in thread pool
         loop = asyncio.get_event_loop()
         summary = await loop.run_in_executor(executor, generate_summary_sync, input.text)
         
@@ -147,7 +193,7 @@ async def summarize(input: InputText):
         return {
             "summary": summary,
             "generation_time_seconds": round(generation_time, 2),
-            "model_type": type(model_engine).__name__
+            "model_type": "PyTorch" if hasattr(model_engine, 'generate') else "ONNX"
         }
         
     except Exception as e:
@@ -158,37 +204,24 @@ async def summarize(input: InputText):
 
 @app.get("/")
 def root():
-    return {"message": "Optimized Roman Urdu Summarizer API is running"}
+    return {
+        "message": "Roman Urdu Summarizer API is running",
+        "status": "ready" if model_engine and model_engine != "failed" else "model_loading_failed"
+    }
 
 @app.get("/health")
 def health_check():
     return {
         "status": "healthy",
-        "model_loaded": model_engine is not None,
-        "model_type": type(model_engine).__name__ if model_engine else None
+        "model_loaded": model_engine is not None and model_engine != "failed",
+        "model_type": "PyTorch" if hasattr(model_engine, 'generate') else "ONNX" if model_engine else "failed"
     }
 
-# Alternative endpoint for batch processing
-@app.post("/batch_summarize")
-async def batch_summarize(inputs: list[InputText]):
-    if model_engine is None:
-        return {"error": "Model not loaded"}
-    
-    start_time = time.time()
-    results = []
-    
-    for item in inputs:
-        try:
-            loop = asyncio.get_event_loop()
-            summary = await loop.run_in_executor(executor, generate_summary_sync, item.text)
-            results.append({"text": item.text, "summary": summary, "success": True})
-        except Exception as e:
-            results.append({"text": item.text, "error": str(e), "success": False})
-    
-    total_time = time.time() - start_time
-    
-    return {
-        "results": results,
-        "total_time_seconds": round(total_time, 2),
-        "average_time_per_item": round(total_time / len(inputs), 2)
-    }
+# Simple test endpoint
+@app.get("/test")
+def test_endpoint():
+    return {"message": "API is responding", "port": "ready"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
