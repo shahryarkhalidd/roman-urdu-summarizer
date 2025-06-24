@@ -8,6 +8,7 @@ app = FastAPI()
 
 # Global variables for models
 model_engine = None
+tokenizer = None
 executor = ThreadPoolExecutor(max_workers=1)
 
 class InputText(BaseModel):
@@ -15,7 +16,7 @@ class InputText(BaseModel):
 
 @app.on_event("startup")
 async def load_model():
-    global model_engine
+    global model_engine, tokenizer
     print("🔄 Installing and loading optimized T5 model...")
     
     try:
@@ -73,7 +74,6 @@ async def load_model():
             from transformers import T5ForConditionalGeneration, T5Tokenizer
             import torch
             
-            global tokenizer
             tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
             model_engine = T5ForConditionalGeneration.from_pretrained("radientsoul88/roman-urdu-summarizer")
             model_engine.eval()
@@ -97,8 +97,9 @@ def generate_summary_sync(input_text: str) -> str:
             
         else:
             # PyTorch model
-            from transformers import T5Tokenizer
-            tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
+            if tokenizer is None:
+                from transformers import T5Tokenizer
+                tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
             
             inputs = tokenizer(
                 f"summarize: {input_text}",
