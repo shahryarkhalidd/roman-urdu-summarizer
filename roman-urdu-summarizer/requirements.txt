@@ -1,7 +1,8 @@
 fastapi
 uvicorn
+onnxruntime
 transformers
 huggingface_hub
-optimum[onnxruntime]
-torch
+scipy
+numpy
 sentencepiece
