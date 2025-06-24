@@ -1,15 +1,13 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import onnxruntime as ort
-import numpy as np
 from transformers import T5Tokenizer
-from scipy.special import softmax
+from optimum.onnxruntime import ORTModelForSeq2SeqLM
 from huggingface_hub import hf_hub_download
 
 app = FastAPI()
 
 # Global cache variables
-session = None
+model = None
 tokenizer = None
 
 class InputText(BaseModel):
@@ -17,54 +15,32 @@ class InputText(BaseModel):
 
 @app.on_event("startup")
 def load_model_and_tokenizer():
-    global session, tokenizer
-    print("🔄 Loading model and tokenizer...")
+    global model, tokenizer
+    print("🔄 Loading optimized model and tokenizer...")
 
-    # Download model
-    model_path = hf_hub_download("radientsoul88/roman-urdu-summarizer", "t5_urdu_quant.onnx")
-    
     # Load tokenizer
     tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
 
-    # Load ONNX session
-    session = ort.InferenceSession(model_path)
-    print("✅ Model and tokenizer loaded.")
+    # Load ORT model
+    model = ORTModelForSeq2SeqLM.from_pretrained("radientsoul88/roman-urdu-summarizer", export=False)
+    print("✅ Optimized model and tokenizer loaded.")
 
 @app.post("/summarize")
 async def summarize(input: InputText):
-    global session, tokenizer
+    global model, tokenizer
 
     input_text = input.text
-    inputs = tokenizer("summarize: " + input_text, return_tensors="np")
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
+    inputs = tokenizer("summarize: " + input_text, return_tensors="pt")
 
-    decoder_input_ids = np.array([[tokenizer.pad_token_id]])
-    decoder_attention_mask = np.array([[1]])
+    outputs = model.generate(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_length=40,
+        num_beams=2,
+        early_stopping=True
+    )
 
-    max_length = 30
-    for _ in range(max_length):
-        outputs = session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "decoder_input_ids": decoder_input_ids,
-                "decoder_attention_mask": decoder_attention_mask
-            }
-        )
-        logits = outputs[0]
-        next_token_logits = logits[:, -1, :]
-        probs = softmax(next_token_logits, axis=-1)
-        next_token_id = np.array([[np.argmax(probs[0])]])
-
-        decoder_input_ids = np.hstack([decoder_input_ids, next_token_id])
-        decoder_attention_mask = np.hstack([decoder_attention_mask, [[1]]])
-
-        if next_token_id[0, 0] == tokenizer.eos_token_id:
-            break
-
-    summary = tokenizer.decode(decoder_input_ids[0], skip_special_tokens=True)
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return {"summary": summary}
 
 @app.get("/")
