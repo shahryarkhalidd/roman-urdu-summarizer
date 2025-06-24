@@ -6,7 +6,7 @@ from huggingface_hub import hf_hub_download
 
 app = FastAPI()
 
-# Global cache variables
+# Global model and tokenizer
 model = None
 tokenizer = None
 
@@ -21,16 +21,20 @@ def load_model_and_tokenizer():
     # Load tokenizer
     tokenizer = T5Tokenizer.from_pretrained("radientsoul88/roman-urdu-summarizer")
 
-    # Load ORT model
-    model = ORTModelForSeq2SeqLM.from_pretrained("radientsoul88/roman-urdu-summarizer", export=False)
+    # Load ORT model (specify the library explicitly to fix Render crash)
+    model = ORTModelForSeq2SeqLM.from_pretrained(
+        "radientsoul88/roman-urdu-summarizer",
+        export=False,
+        library="transformers"  # ✅ fix: explicitly declare library
+    )
+
     print("✅ Optimized model and tokenizer loaded.")
 
 @app.post("/summarize")
 async def summarize(input: InputText):
     global model, tokenizer
 
-    input_text = input.text
-    inputs = tokenizer("summarize: " + input_text, return_tensors="pt")
+    inputs = tokenizer("summarize: " + input.text, return_tensors="pt")
 
     outputs = model.generate(
         input_ids=inputs["input_ids"],
